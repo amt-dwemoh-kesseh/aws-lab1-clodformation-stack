@@ -1,0 +1,205 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: "IAM User Creation with OTP, Groups, and EventBridge Notification"
+
+Parameters:
+  EC2UserEmail:
+    Type: String
+    Description: Email address for the ec2-user
+  S3UserEmail:
+    Type: String
+    Description: Email address for the s3-user
+
+Resources:
+  # One-Time Password in Secrets Manager
+  UserOTPSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: iam-user-initial-password
+      Description: Initial one-time password for IAM users
+      GenerateSecretString:
+        SecretStringTemplate: '{}'
+        GenerateStringKey: password
+        PasswordLength: 16
+        ExcludeCharacters: '"@/\'
+        RequireEachIncludedType: true
+      Tags:
+        - Key: Purpose
+          Value: IAMUserInitialPassword
+
+  # S3 User Group with read access to S3
+  S3ReadGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: S3ReadGroup
+      Policies:
+        - PolicyName: S3ReadOnlyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:Get*
+                  - s3:List*
+                Resource: "*"
+
+  # EC2 Group with read access to EC2
+  EC2ReadGroup:
+    Type: AWS::IAM::Group
+    Properties:
+      GroupName: EC2ReadGroup
+      Policies:
+        - PolicyName: EC2ReadOnlyAccess
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:Describe*
+                  - ec2:Get*
+                Resource: "*"
+
+  # EC2 User
+  EC2User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: ec2-user
+      Groups:
+        - !Ref EC2ReadGroup
+      LoginProfile:
+        Password: !Sub "{{resolve:secretsmanager:${UserOTPSecret}::password}}"
+        PasswordResetRequired: true
+
+  # Store EC2 user email in Parameter Store
+  EC2UserEmailParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /iam/users/ec2-user/email
+      Type: String
+      Value: !Ref EC2UserEmail
+      Description: Email address for ec2-user
+
+  # S3 User
+  S3User:
+    Type: AWS::IAM::User
+    Properties:
+      UserName: s3-user
+      Groups:
+        - !Ref S3ReadGroup
+      LoginProfile:
+        Password: !Sub "{{resolve:secretsmanager:${UserOTPSecret}::password}}"
+        PasswordResetRequired: true
+
+  # Store S3 user email in Parameter Store
+  S3UserEmailParam:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: /iam/users/s3-user/email
+      Type: String
+      Value: !Ref S3UserEmail
+      Description: Email address for s3-user
+
+  # Lambda Execution Role
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: LambdaAccessPolicies
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ssm:GetParameter
+                Resource: !Sub arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/iam/users/*
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                Resource: !Ref UserOTPSecret
+
+  # Lambda Function to process new user creation
+  UserCreationLogger:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: IAMUserCreationLogger
+      Handler: index.handler
+      Runtime: python3.8
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+
+          def handler(event, context):
+              # Extract username from the event
+              username = event['detail']['requestParameters']['userName']
+              
+              # Get the email from Parameter Store
+              ssm = boto3.client('ssm')
+              email_param = ssm.get_parameter(
+                  Name=f'/iam/users/{username}/email',
+                  WithDecryption=False
+              )
+              email = email_param['Parameter']['Value']
+              
+              # Get the OTP from Secrets Manager
+              secrets = boto3.client('secretsmanager')
+              secret = secrets.get_secret_value(SecretId='iam-user-initial-password')
+              otp = secret['SecretString']
+              
+              # Log the information (in production, you might send an email or store in a database)
+              print(f"New user created: {username}")
+              print(f"Email: {email}")
+              print(f"Temporary password: {otp}")
+              
+              return {
+                  'statusCode': 200,
+                  'body': f"Processed user {username}"
+              }
+
+  # Permission for EventBridge to invoke the Lambda
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt UserCreationLogger.Arn
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt UserCreationEventRule.Arn
+
+  # EventBridge Rule to detect new user creation
+  UserCreationEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Trigger when a new IAM user is created
+      EventPattern:
+        source:
+          - aws.iam
+        detail-type:
+          - AWS API Call via CloudTrail
+        detail:
+          eventSource:
+            - iam.amazonaws.com
+          eventName:
+            - CreateUser
+      Targets:
+        - Arn: !GetAtt UserCreationLogger.Arn
+          Id: UserCreationLoggerTarget
+
+Outputs:
+  SecretARN:
+    Description: ARN of the secret containing the initial password
+    Value: !Ref UserOTPSecret
+  LambdaFunctionARN:
+    Description: ARN of the Lambda function
+    Value: !GetAtt UserCreationLogger.Arn
+  EventRuleARN:
+    Description: ARN of the EventBridge rule
+    Value: !GetAtt UserCreationEventRule.Arn
